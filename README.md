@@ -1,27 +1,24 @@
 # TACC HPC MCP Server
 
-Connect [Claude Code](https://claude.ai/claude-code) directly to your project on TACC Lonestar6.
-Once set up, Claude can check job status, read log files, cancel jobs, pull code, and run commands
-on TACC — without you ever leaving your editor.
+Connect [Claude Code](https://claude.ai/claude-code) directly to your project on TACC Lonestar6 (or any SLURM cluster).
+Once set up, Claude can check job status, read logs, browse files, cancel jobs, and run commands on TACC — without you ever leaving your editor.
 
 ```
-You: "Check if my pipeline jobs are still running"
-Claude: [calls job_status] → shows live squeue output
+You: "Are my pipeline jobs still running?"
+Claude: [calls job_status] → live squeue output
 
 You: "The coloc step failed — show me the last 50 lines of that log"
 Claude: [calls read_log(step="07_coloc", tail_lines=50)] → shows the error
 
-You: "Cancel jobs 3210160 and 3210161"
-Claude: [calls cancel_jobs("3210160 3210161")] → done
+You: "Did the phenotype prep finish? Check the outputs."
+Claude: [calls check_outputs(agent=1)] → ✓ pheno_quantitative.txt 34M, ✗ MISSING: regenie/step1/
 ```
 
 ---
 
 ## How it works
 
-The MCP server runs **locally on your Mac**. It connects to TACC using a persistent SSH
-ControlMaster session — you authenticate once with your password and 2FA token, and every
-tool call reuses that connection silently for up to 4 hours.
+The MCP server runs **locally on your Mac**. It connects to TACC over a persistent SSH ControlMaster session — you authenticate once with your password + 2FA token, and every Claude tool call reuses that connection silently for up to 4 hours.
 
 ```
 Claude Code  ──MCP──▶  server.py (local)  ──SSH ControlMaster──▶  TACC Lonestar6
@@ -33,9 +30,9 @@ No credentials are stored. No data goes to any third party. It's just `ssh` unde
 
 ## Prerequisites
 
-- **Mac or Linux** with Python 3.9+ (the setup script handles the rest)
+- **Mac or Linux** with Python 3.10+
 - **TACC account** with SSH access to Lonestar6 (`ls6.tacc.utexas.edu`)
-- **Claude Code** installed (`npm install -g @anthropic-ai/claude-code`)
+- **Claude Code CLI** installed — `npm install -g @anthropic-ai/claude-code`
 - **Your project cloned on TACC** — the server points to a specific directory
 
 ---
@@ -45,106 +42,154 @@ No credentials are stored. No data goes to any third party. It's just `ssh` unde
 ### 1. Clone this repo
 
 ```bash
-git clone https://github.com/YOUR_LAB/tacc-mcp.git
+git clone https://github.com/Devanshpandey/tacc-mcp.git
 cd tacc-mcp
 ```
 
-### 2. Run the setup wizard
+### 2. Create a dedicated Python environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install mcp
+```
+
+Or with `uv` (faster):
+
+```bash
+uv venv .venv --python 3.12
+uv pip install --python .venv/bin/python mcp
+```
+
+### 3. Run the setup wizard
 
 ```bash
 python3 setup.py
 ```
 
-The wizard will ask for:
+The wizard asks for:
 - Your TACC username and hostname (default: `ls6.tacc.utexas.edu`)
-- An SSH alias (default: `tacc` — used as `ssh tacc`)
-- The absolute path to your project on TACC, e.g.:
-  `/work/07880/jsmith/lonestar/my-project`
+- A short SSH alias (default: `tacc` — used as `ssh tacc`)
+- The absolute path to your project on TACC, e.g. `/work/07880/jsmith/lonestar/my-project`
 - The subfolder where your pipeline writes run logs (default: `logs/runs`)
 
 It will:
 1. Add a `ControlMaster` SSH block to `~/.ssh/config`
 2. Write `~/.tacc_mcp.json` (your local config — never committed to git)
-3. Install `uv` (if not present) and Python 3.12 + the `mcp` package
-4. Print the `.claude/settings.json` snippet you need to add
 
-### 3. Add to your project's `.claude/settings.json`
+### 4. Register the MCP server with Claude Code
 
-The setup wizard prints this snippet — copy it into `.claude/settings.json` in
-**your analysis project** (not this repo):
-
-```json
-{
-  "mcpServers": {
-    "tacc-hpc": {
-      "command": "/Users/YOU/.local/bin/uv",
-      "args": [
-        "run",
-        "--python", "3.12",
-        "--with", "mcp",
-        "/path/to/tacc-mcp/server.py"
-      ]
-    }
-  }
-}
+```bash
+claude mcp add tacc-hpc \
+  /path/to/tacc-mcp/.venv/bin/python \
+  /path/to/tacc-mcp/server.py
 ```
 
-> **Tip:** The paths in the snippet are absolute. Each lab member gets their own
-> snippet pointing to wherever they cloned this repo on their Mac.
+Replace `/path/to/tacc-mcp` with wherever you cloned this repo, e.g.:
 
-### 4. Open your daily SSH session
+```bash
+claude mcp add tacc-hpc \
+  /Users/jsmith/tools/tacc-mcp/.venv/bin/python \
+  /Users/jsmith/tools/tacc-mcp/server.py
+```
 
-Before using Claude Code, open one authenticated session to TACC:
+> **Important:** use `claude mcp add`, not a manual `settings.json` edit.
+> Claude Code stores MCP config in `~/.claude.json` scoped to your project directory,
+> and `claude mcp add` writes to exactly the right place.
+
+Verify it's connected:
+
+```bash
+claude mcp list
+# tacc-hpc: ... — ✓ Connected
+```
+
+### 5. Open your daily SSH session
+
+Before using any TACC tool in Claude, authenticate once:
 
 ```bash
 ssh tacc
 # Enter: TACC password + 6-digit authenticator code
 ```
 
-This session stays open for **4 hours** (configurable in `~/.ssh/config`).
-You don't need to keep the terminal open — the connection is backgrounded.
+The connection stays open for **4 hours** (configurable in `~/.ssh/config`). You don't need to keep the terminal window open — the ControlMaster runs in the background.
 
-### 5. Restart Claude Code
+### 6. Start Claude Code and call `get_started()`
 
-Restart Claude Code in your project directory. You should see `tacc-hpc` listed
-in the MCP servers panel (bottom-left in the VS Code extension, or via `/mcp` in the CLI).
+Open Claude Code in your project directory. The `tacc-hpc` tools are now available.
+Ask Claude to call `get_started()` for a live status check and full tool tour:
+
+```
+"Call get_started() on the TACC MCP"
+```
 
 ---
 
-## Available tools
+## Available tools (20 total)
 
+### Connection
 | Tool | Description |
 |---|---|
-| `check_connection` | Verify the SSH session is alive |
-| `job_status` | Live `squeue` — all pending/running jobs |
-| `pipeline_status` | Manifest × squeue cross-reference — which step is where |
-| `cancel_jobs` | `scancel` by job ID(s) |
-| `list_runs` | Show all pipeline run directories, newest first |
-| `list_logs` | List log files in a run directory |
-| `read_log` | Tail a log by step name or full path |
-| `git_pull` | Pull latest code on TACC |
-| `git_status` | Git status + recent commits on TACC |
-| `disk_usage` | Quota + df for `$WORK` and `$SCRATCH` |
-| `run_command` | Run any shell command on TACC |
+| `get_started()` | Interactive tutorial — status check, tool reference, common workflows, troubleshooting |
+| `check_connection()` | Verify SSH ControlMaster is alive; shows hostname, user, load |
 
-### Example prompts
+### SLURM Job Management
+| Tool | Description |
+|---|---|
+| `job_status()` | Live `squeue` — all pending/running jobs with state and wait reason |
+| `job_history(days=3)` | `sacct` — recently completed, failed, or cancelled jobs |
+| `job_details(job_id)` | Full SLURM metadata for one job (work dir, resources, exit code) |
+| `cancel_jobs("id1 id2")` | `scancel` one or more jobs by ID |
+
+### Pipeline Management
+| Tool | Description |
+|---|---|
+| `pipeline_status()` | Cross-reference `manifest.tsv` with live queue — which step is where |
+| `list_runs()` | List all pipeline run directories, newest first |
+| `run_pipeline(script, args)` | Submit a `run_all.sh` or step script via nohup |
+| `check_outputs(agent)` | Verify expected output files exist for each pipeline agent (1–4) |
+
+### Files & Logs
+| Tool | Description |
+|---|---|
+| `list_dir(path)` | `ls -lh` any remote directory |
+| `read_file(path, head_lines, tail_lines)` | Read any text file on TACC — logs, CSVs, scripts |
+| `list_logs(run_id)` | List log files for a pipeline run |
+| `read_log(step, tail_lines, stream)` | Tail a SLURM log by step name prefix or full path |
+| `grep_file(pattern, path)` | Search a remote file with context lines |
+
+### System & Git
+| Tool | Description |
+|---|---|
+| `disk_usage()` | Quota + `df` for `$HOME`, `$WORK`, `$SCRATCH` + project dir sizes |
+| `node_load()` | Login node CPU/memory snapshot |
+| `git_status()` | Git status + 5 recent commits in the project on TACC |
+| `git_pull()` | Pull latest code on TACC (run after pushing from your Mac) |
+| `run_command(cmd)` | Run any shell command on TACC (escape hatch) |
+
+---
+
+## Example prompts
 
 ```
-"Are my pipeline jobs still running?"
+"Are my jobs still running?"
+"What happened to the phenotype prep job — did it succeed?"
 "Show me the last 100 lines of the LDSC log"
-"The coloc step failed — what's the error?"
-"Cancel all my pending jobs"
+"Check all agent 1 output files"
+"Cancel jobs 3210160 and 3210161"
 "Git pull on TACC then tell me what changed"
 "How much disk space do I have left on scratch?"
-"List all my pipeline runs"
-"Run: cat /work/.../results/agent1/ldsc_rg_matrix.csv"
+"List all pipeline runs"
+"Read the regenie step1 log — did it finish?"
+"Is there an error in any of the GWAS logs?"
 ```
 
 ---
 
 ## Configuration reference
 
-`~/.tacc_mcp.json` is written by `setup.py`. You can also edit it directly:
+`~/.tacc_mcp.json` is written by `setup.py`. You can also create/edit it directly:
 
 ```json
 {
@@ -160,57 +205,71 @@ in the MCP servers panel (bottom-left in the VS Code extension, or via `/mcp` in
 | `tacc_host` | Yes | SSH alias from `~/.ssh/config` |
 | `tacc_user` | Yes | Your TACC username |
 | `project_dir` | Yes | Absolute path to project root on TACC |
-| `logs_subdir` | No | Log directory relative to `project_dir` (default: `logs/runs`) |
+| `logs_subdir` | No | Log subdirectory relative to `project_dir` (default: `logs/runs`) |
 
 ---
 
 ## Troubleshooting
 
-### "Not connected to TACC"
+### Tools don't appear in Claude Code after setup
 
-Your ControlMaster session has expired or was never opened. Fix:
+The most common cause: MCP config was written to `settings.json` instead of `~/.claude.json`.
+Always use `claude mcp add` (not manual edits) and restart Claude Code afterward.
 
+Verify registration:
+```bash
+claude mcp list
+```
+
+If the server shows an error, test it directly:
+```bash
+/path/to/tacc-mcp/.venv/bin/python /path/to/tacc-mcp/server.py
+# Should start silently waiting for input (Ctrl+C to stop)
+```
+
+### "Not connected to TACC" / SSH timeout
+
+Your ControlMaster session has expired. Open a new one:
 ```bash
 ssh tacc
 ```
 
 ### "Config file not found"
 
-Run `setup.py` first, or manually create `~/.tacc_mcp.json` (see Configuration reference).
+Run `setup.py`, or create `~/.tacc_mcp.json` manually (see Configuration reference above).
 
-### MCP server doesn't appear in Claude Code
-
-1. Check `.claude/settings.json` is in your **project** directory (not home)
-2. Verify the `command` path (`uv`) and `server.py` path are correct
-3. Restart Claude Code
-
-### Test the server manually
-
-```bash
-cd tacc-mcp
-~/.local/bin/uv run --python 3.12 --with mcp python3 server.py
-# Should start without errors (Ctrl+C to stop)
-```
-
-### ControlMaster keeps timing out
+### ControlMaster session expires too quickly
 
 Increase `ControlPersist` in `~/.ssh/config`:
-
 ```
 Host tacc
-    ControlPersist 8h   # was 4h
+    ControlPersist 8h
+```
+
+---
+
+## How MCP registration works (for the curious)
+
+Claude Code stores per-project MCP server config in `~/.claude.json` under a `projects` key.
+`claude mcp add` writes to the correct location automatically for whichever directory you run it from.
+
+The wrong approaches (which look right but don't work):
+- `~/.claude/settings.json` — read by the CLI for other settings, not MCP servers
+- `.claude/settings.json` (project-level) — not picked up in all Claude Code environments
+
+The right approach:
+```bash
+cd /your/project
+claude mcp add tacc-hpc /path/to/.venv/bin/python /path/to/server.py
 ```
 
 ---
 
 ## Security notes
 
-- `~/.tacc_mcp.json` contains your TACC username and project path — treat it like any
-  other config file. It does **not** contain passwords or tokens.
-- No credentials are passed through the MCP server. All auth happens via the SSH
-  ControlMaster session you open yourself.
-- `run_command` lets Claude run arbitrary commands on TACC login nodes. It will only
-  do what you ask it to — Claude Code always shows you tool calls before executing.
+- `~/.tacc_mcp.json` contains your TACC username and project path — treat it like any other config file. It does **not** contain passwords or tokens.
+- No credentials pass through the MCP server. All auth happens via the SSH ControlMaster session you open yourself.
+- `run_command` lets Claude run arbitrary shell commands on TACC login nodes. Claude Code always shows you tool calls before executing — you stay in control.
 
 ---
 
@@ -218,9 +277,9 @@ Host tacc
 
 ```
 tacc-mcp/
-├── server.py        — MCP server (reads ~/.tacc_mcp.json)
+├── server.py        — MCP server (20 tools, reads ~/.tacc_mcp.json)
 ├── setup.py         — interactive setup wizard
-├── requirements.txt — Python dependencies
+├── requirements.txt — Python dependencies (mcp)
 └── README.md        — this file
 ```
 
@@ -228,16 +287,13 @@ tacc-mcp/
 
 ## Adapting to other HPC systems
 
-`server.py` only uses standard `ssh` and `squeue`/`scancel` — it works on any
-SLURM cluster, not just TACC. Change `tacc_host` in your config to point at a
-different machine. The only TACC-specific assumption is `ls6.tacc.utexas.edu` as
-the default hostname in `setup.py`, which you can override.
+`server.py` uses standard POSIX `ssh`, `squeue`, and `scancel` — it works on any SLURM cluster, not just TACC. Point `tacc_host` in your config to a different machine. The only TACC-specific assumption is the default hostname in `setup.py`, which you can override during setup.
 
 ---
 
 ## Contributing
 
-PRs welcome. Useful additions:
-- `submit_job` — submit a specific SLURM script
-- `tail_live` — stream a log file in real time
-- Support for multiple HPC systems in one config
+PRs welcome. The server is a single file — easy to extend. Ideas:
+- `watch_job(job_id)` — poll until a job reaches a terminal state
+- `submit_job(script)` — `sbatch` with output capture
+- Multi-cluster config (e.g. Frontera + Lonestar6 in one server)
