@@ -829,5 +829,428 @@ def run_command(command: str, timeout: int = 120) -> str:
     return result or "(no output)"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 8 — ANALYSIS CO-PILOT (fetch, interpret, submit)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _scp(remote_path: str, local_path: str, recursive: bool = False) -> dict:
+    """Copy a file or directory from TACC to local via scp over ControlMaster."""
+    host = _host()
+    Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+    flag = "-r " if recursive else ""
+    try:
+        result = subprocess.run(
+            ["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+             "-o", f"ControlPath=~/.ssh/cm_%r@%h:%p"]
+            + (["-r"] if recursive else [])
+            + [f"{host}:{remote_path}", local_path],
+            capture_output=True, text=True, timeout=300,
+        )
+        return {
+            "stdout":     result.stdout,
+            "stderr":     result.stderr,
+            "returncode": result.returncode,
+            "ok":         result.returncode == 0,
+        }
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": "scp timed out (300s).", "returncode": -1, "ok": False}
+    except Exception as e:
+        return {"stdout": "", "stderr": str(e), "returncode": -1, "ok": False}
+
+
+def _rsync(remote_path: str, local_path: str, pattern: str = "*") -> dict:
+    """Rsync a remote directory to local, filtering by pattern."""
+    host = _host()
+    Path(local_path).mkdir(parents=True, exist_ok=True)
+    try:
+        result = subprocess.run(
+            ["rsync", "-az", "--progress",
+             "-e", "ssh -o BatchMode=yes -o ConnectTimeout=8",
+             f"{host}:{remote_path}/",
+             f"{local_path}/"],
+            capture_output=True, text=True, timeout=600,
+        )
+        return {
+            "stdout":     result.stdout,
+            "stderr":     result.stderr,
+            "returncode": result.returncode,
+            "ok":         result.returncode == 0,
+        }
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": "rsync timed out (600s).", "returncode": -1, "ok": False}
+    except Exception as e:
+        return {"stdout": "", "stderr": str(e), "returncode": -1, "ok": False}
+
+
+@mcp.tool()
+def fetch_file(
+    remote_path: str,
+    local_path: str = "",
+) -> str:
+    """
+    Copy a single file from TACC to your local Mac via scp.
+    After fetching, Claude can read the file directly and interpret results.
+
+    remote_path: absolute path on TACC
+    local_path:  destination on your Mac. Defaults to ~/Downloads/tacc_results/<filename>
+
+    Examples:
+      fetch_file("/work/.../results/agent1_genetics/ldsc/ldsc_rg_matrix.csv")
+      fetch_file("/work/.../results/agent1_genetics/gwas/LDL_C.regenie.gz",
+                 "/tmp/ldl_gwas.regenie.gz")
+    """
+    cfg, err = _require_cfg()
+    if err:
+        return err
+
+    fname = Path(remote_path).name
+    if not local_path:
+        local_path = str(Path.home() / "Downloads" / "tacc_results" / fname)
+
+    r = _scp(remote_path, local_path)
+    if not r["ok"]:
+        return f"scp failed: {r['stderr']}\nMake sure the remote path exists: {remote_path}"
+
+    size = Path(local_path).stat().st_size if Path(local_path).exists() else 0
+    return (
+        f"✓  Fetched to local: {local_path}  ({size/1024/1024:.1f} MB)\n"
+        f"   Remote was: {remote_path}\n\n"
+        f"You can now read the file locally with Claude's Read tool:\n"
+        f"  Read({local_path!r})"
+    )
+
+
+@mcp.tool()
+def fetch_results(
+    agent: int = 1,
+    local_dir: str = "",
+    dry_run: bool = False,
+) -> str:
+    """
+    Fetch key result files for a pipeline agent from TACC to your local Mac.
+    Pulls only lightweight analysis files (CSVs, logs, summaries) — not raw GWAS sumstats.
+    Once fetched, Claude can read them, plot them, and give biological interpretations.
+
+    agent:     1 (genetics), 2 (genes), 3 (networks), 4 (subtypes)
+    local_dir: destination directory on your Mac.
+               Defaults to ~/Downloads/tacc_results/agent{N}/
+    dry_run:   if True, list what would be fetched without downloading
+
+    Typical workflow:
+      1. check_outputs(agent=1)          — confirm files exist
+      2. fetch_results(agent=1)          — pull them locally
+      3. "Plot the genetic correlation matrix and interpret it"
+         → Claude reads the CSV, writes a Python plot script, runs it
+    """
+    cfg, err = _require_cfg()
+    if err:
+        return err
+
+    proj = _project()
+    if not local_dir:
+        local_dir = str(Path.home() / "Downloads" / "tacc_results" / f"agent{agent}")
+
+    # Key lightweight files to fetch per agent (skip raw sumstats — too large)
+    fetch_targets = {
+        1: [
+            # Phenotype summaries
+            (f"{proj}/results/agent1_genetics/phenotypes/phenotype_summary.txt", "phenotypes/"),
+            # LDSC
+            (f"{proj}/results/agent1_genetics/ldsc/ldsc_rg_matrix.csv",         "ldsc/"),
+            # Colocalisation
+            (f"{proj}/results/agent1_genetics/coloc/coloc_results.csv",          "coloc/"),
+            # MR
+            (f"{proj}/results/agent1_genetics/mr/mr_causal_evidence_table.csv",  "mr/"),
+            # Fine-mapping
+            (f"{proj}/results/agent1_genetics/finemapping/finemapping_credible_sets.csv", "finemapping/"),
+            # GWAS top hits (pre-filtered)
+            (f"{proj}/results/agent1_genetics/gwas/top_hits_all_traits.csv",     "gwas/"),
+            # Any QQ/Manhattan plots already generated on TACC
+            (f"{proj}/results/agent1_genetics/gwas/plots/",                      "gwas/plots/"),
+        ],
+        2: [
+            (f"{proj}/results/agent2_genes/ranked_causal_gene_table.csv",        ""),
+            (f"{proj}/results/agent2_genes/gene_evidence_heatmap.png",           ""),
+        ],
+        3: [
+            (f"{proj}/results/agent3_networks/pathway_enrichment_table.csv",     ""),
+            (f"{proj}/results/agent3_networks/ranked_pathway_list.csv",          ""),
+            (f"{proj}/results/agent3_networks/network_modules.json",             ""),
+            (f"{proj}/results/agent3_networks/cad_network_map.html",             ""),
+        ],
+        4: [
+            (f"{proj}/results/agent4_subtypes/patient_subtype_assignments.csv",  ""),
+            (f"{proj}/results/agent4_subtypes/subtype_prs_profiles.csv",         ""),
+            (f"{proj}/results/agent4_subtypes/subtype_outcome_associations.csv", ""),
+        ],
+    }
+
+    if agent not in fetch_targets:
+        return f"Unknown agent {agent}. Choose 1, 2, 3, or 4."
+
+    targets = fetch_targets[agent]
+
+    if dry_run:
+        lines = [f"Would fetch to: {local_dir}/\n"]
+        for remote, subdir in targets:
+            lines.append(f"  {remote}")
+        return "\n".join(lines)
+
+    results = []
+    fetched, skipped, failed = 0, 0, 0
+
+    for remote, subdir in targets:
+        dest_dir = str(Path(local_dir) / subdir)
+        is_dir = remote.endswith("/")
+
+        # Check if remote exists first
+        check = _ssh(f"test -e '{remote.rstrip('/')}' && echo EXISTS || echo MISSING")
+        if "MISSING" in check.get("stdout", ""):
+            results.append(f"  ⊘  MISSING (skip): {Path(remote).name}")
+            skipped += 1
+            continue
+
+        if is_dir:
+            r = _rsync(remote.rstrip("/"), dest_dir)
+        else:
+            local_dest = str(Path(dest_dir) / Path(remote).name) if subdir else str(Path(local_dir) / Path(remote).name)
+            r = _scp(remote, local_dest)
+
+        if r["ok"]:
+            results.append(f"  ✓  {Path(remote.rstrip('/')).name}")
+            fetched += 1
+        else:
+            results.append(f"  ✗  FAILED: {Path(remote.rstrip('/')).name} — {r['stderr'][:80]}")
+            failed += 1
+
+    summary = f"Fetched {fetched} files to: {local_dir}/\n"
+    if skipped:
+        summary += f"({skipped} not yet generated — run check_outputs(agent={agent}) to see status)\n"
+    if failed:
+        summary += f"({failed} failed — check SSH connection)\n"
+
+    return summary + "\n" + "\n".join(results) + (
+        f"\n\nNext steps:\n"
+        f"  • Ask Claude to read and interpret: 'Read the files in {local_dir} and summarise the findings'\n"
+        f"  • Ask for plots: 'Plot the genetic correlation matrix as a heatmap'\n"
+        f"  • Ask for biology: 'Which MR results show the strongest causal evidence? Interpret them'"
+    )
+
+
+@mcp.tool()
+def submit_analysis(
+    script: str,
+    job_name: str = "claude_analysis",
+    time: str = "2:00:00",
+    memory: str = "32G",
+    cpus: int = 4,
+    partition: str = "normal",
+    email: str = "",
+) -> str:
+    """
+    Write and submit an arbitrary analysis script to TACC as a SLURM job.
+    Use this to run new analyses, plotting scripts, or sub-analyses on TACC
+    that Claude has written based on results inspection.
+
+    script:    full script content (bash, Rscript, python3, etc.) — include the shebang line
+    job_name:  SLURM job name (default: claude_analysis)
+    time:      wall time limit (default: 2:00:00)
+    memory:    memory per node (default: 32G)
+    cpus:      CPUs per task (default: 4)
+    partition: SLURM partition (default: normal)
+    email:     email for job notifications (optional)
+
+    Examples:
+      submit_analysis(
+          script=\"\"\"#!/bin/bash
+    module load Rstats
+    Rscript /work/.../scripts/plot_manhattan.R \\
+        --input /work/.../results/gwas/LDL_C.regenie \\
+        --out   /work/.../results/gwas/plots/LDL_C_manhattan.png
+    \"\"\",
+          job_name="ldl_manhattan", time="0:30:00", memory="8G"
+      )
+    """
+    cfg, err = _require_cfg()
+    if err:
+        return err
+
+    proj = _project()
+    host = _host()
+    user = _user()
+
+    email_line = f"#SBATCH --mail-user={email}\n#SBATCH --mail-type=END,FAIL" if email else ""
+
+    sbatch_header = textwrap.dedent(f"""
+        #!/bin/bash
+        #SBATCH --job-name={job_name}
+        #SBATCH --output={proj}/logs/claude_jobs/{job_name}_%j.out
+        #SBATCH --error={proj}/logs/claude_jobs/{job_name}_%j.err
+        #SBATCH --time={time}
+        #SBATCH --mem={memory}
+        #SBATCH --cpus-per-task={cpus}
+        #SBATCH --partition={partition}
+        #SBATCH --account={user}
+        {email_line}
+    """).strip()
+
+    # If script already has a shebang, prepend SBATCH directives after it
+    lines = script.strip().splitlines()
+    if lines and lines[0].startswith("#!"):
+        full_script = lines[0] + "\n" + sbatch_header + "\n\n" + "\n".join(lines[1:])
+    else:
+        full_script = "#!/bin/bash\n" + sbatch_header + "\n\n" + script.strip()
+
+    # Escape for SSH heredoc
+    escaped = full_script.replace("'", "'\\''")
+
+    r = _ssh(
+        f"mkdir -p {proj}/logs/claude_jobs && "
+        f"SCRIPT=$(mktemp {proj}/logs/claude_jobs/{job_name}_XXXXXX.sh) && "
+        f"cat > $SCRIPT << 'CLAUDE_SCRIPT_EOF'\n{full_script}\nCLAUDE_SCRIPT_EOF\n"
+        f"chmod +x $SCRIPT && "
+        f"sbatch $SCRIPT 2>&1 && echo SCRIPT_PATH=$SCRIPT",
+        timeout=30,
+    )
+
+    if not r["ok"]:
+        return f"sbatch failed:\n{r['stderr']}\n\nScript that was attempted:\n{full_script[:500]}"
+
+    out = r["stdout"].strip()
+    job_id = ""
+    for line in out.splitlines():
+        if "Submitted batch job" in line:
+            job_id = line.split()[-1]
+    script_path = next((l.split("=",1)[1] for l in out.splitlines() if l.startswith("SCRIPT_PATH=")), "")
+
+    return (
+        f"✓  Job submitted to TACC\n"
+        f"   Job ID   : {job_id}\n"
+        f"   Job name : {job_name}\n"
+        f"   Script   : {script_path}\n"
+        f"   Log out  : {proj}/logs/claude_jobs/{job_name}_{job_id}.out\n"
+        f"   Log err  : {proj}/logs/claude_jobs/{job_name}_{job_id}.err\n\n"
+        f"Monitor with:  job_status()\n"
+        f"Read log with: read_log(path='{proj}/logs/claude_jobs/{job_name}_{job_id}.out')"
+    )
+
+
+@mcp.tool()
+def run_remote_script(
+    script: str,
+    interpreter: str = "bash",
+    timeout: int = 120,
+) -> str:
+    """
+    Run a short script on the TACC login node and return its output directly.
+    Use for lightweight operations that don't need a SLURM job — quick R/Python
+    snippets, file inspection, data summaries, top-hits extraction, etc.
+    For heavy computation use submit_analysis() instead.
+
+    script:      script content to run (no shebang needed)
+    interpreter: bash (default), python3, Rscript, python, awk, perl
+    timeout:     seconds to wait (default 120 — use submit_analysis for longer jobs)
+
+    Examples:
+      run_remote_script(
+          \"\"\"library(data.table)
+    dt <- fread('/work/.../ldsc_rg_matrix.csv')
+    print(summary(dt))
+    \"\"\", interpreter="Rscript")
+
+      run_remote_script(
+          \"\"\"import pandas as pd
+    df = pd.read_csv('/work/.../mr_causal_evidence_table.csv')
+    print(df.sort_values('pval').head(20).to_string())
+    \"\"\", interpreter="python3")
+    """
+    cfg, err = _require_cfg()
+    if err:
+        return err
+
+    proj = _project()
+
+    # Write script to a temp file and run it
+    r = _ssh(
+        f"SCRIPT=$(mktemp /tmp/claude_script_XXXXXX) && "
+        f"cat > $SCRIPT << 'CLAUDE_EOF'\n{script}\nCLAUDE_EOF\n"
+        f"{interpreter} $SCRIPT 2>&1; "
+        f"rm -f $SCRIPT",
+        timeout=timeout,
+    )
+    out = (r["stdout"] + r["stderr"]).strip()
+    status = "✓" if r["ok"] else f"✗ (exit {r['returncode']})"
+    return f"{status}  [{interpreter}]\n\n{out or '(no output)'}"
+
+
+@mcp.tool()
+def gwas_top_hits(
+    phenotype: str,
+    n: int = 50,
+    pval_threshold: float = 5e-8,
+) -> str:
+    """
+    Extract the top GWAS hits for a phenotype from REGENIE summary statistics on TACC.
+    Returns the N most significant SNPs above genome-wide significance threshold.
+    Claude will then interpret these hits biologically.
+
+    phenotype:       trait name matching the REGENIE output file
+                     (e.g. "LDL_C", "CAD", "HDL_C", "TG", "MACE")
+    n:               number of top hits to return (default 50)
+    pval_threshold:  p-value threshold (default 5e-8 genome-wide significance)
+
+    The output is returned directly so Claude can immediately interpret
+    which loci are novel, which map to known lipid/CAD genes, and
+    suggest follow-up analyses.
+    """
+    cfg, err = _require_cfg()
+    if err:
+        return err
+
+    proj = _project()
+    gwas_dir = f"{proj}/results/agent1_genetics/gwas"
+
+    # Find the relevant sumstats file
+    find_r = _ssh(
+        f"find {gwas_dir} -name '*{phenotype}*' "
+        f"\\( -name '*.regenie' -o -name '*.regenie.gz' -o -name '*.tsv' \\) 2>/dev/null | head -3"
+    )
+    if not find_r["ok"] or not find_r["stdout"].strip():
+        return (
+            f"No GWAS summary stats found for '{phenotype}' in {gwas_dir}\n"
+            f"Available files:\n"
+            + _ssh(f"ls {gwas_dir}/ 2>/dev/null").get("stdout", "(empty)")
+        )
+
+    sumstat_file = find_r["stdout"].strip().splitlines()[0]
+    is_gz = sumstat_file.endswith(".gz")
+    cat_cmd = f"zcat {sumstat_file}" if is_gz else f"cat {sumstat_file}"
+
+    # Extract top hits: sort by p-value, filter by threshold, take top N
+    # REGENIE format: CHROM GENPOS ID ALLELE0 ALLELE1 A1FREQ INFO N TEST BETA SE CHISQ LOG10P EXTRA
+    script = (
+        f"{cat_cmd} | awk 'NR==1{{print; next}} "
+        f"$14 >= {-__import__('math').log10(pval_threshold):.4f} {{print}}' | "
+        f"sort -k14 -rn | head -{n}"
+    )
+
+    r = _ssh(script, timeout=60)
+    if not r["ok"] or not r["stdout"].strip():
+        return f"Could not extract top hits from {sumstat_file}:\n{r['stderr']}"
+
+    lines = r["stdout"].strip().splitlines()
+    header = lines[0] if lines else ""
+    hits = lines[1:] if len(lines) > 1 else []
+
+    return (
+        f"Top {len(hits)} GWAS hits for {phenotype} (p < {pval_threshold:.0e})\n"
+        f"Source: {sumstat_file}\n"
+        f"{'─'*80}\n"
+        f"{header}\n"
+        + "\n".join(hits)
+        + f"\n\n[{len(hits)} loci above genome-wide significance threshold]"
+    )
+
+
 if __name__ == "__main__":
     mcp.run()
